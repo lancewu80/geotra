@@ -41,6 +41,7 @@ class VideoDetector:
         self._loop.call_soon_threadsafe(self._queue.put_nowait, events)
 
     def _run(self) -> None:
+        import cv2  # imported lazily: heavy import, only needed here
         from ultralytics import YOLO  # imported lazily: heavy import, only needed here
 
         source: str | int = settings.camera_source
@@ -49,20 +50,46 @@ class VideoDetector:
         except ValueError:
             pass
 
+        # Ultralytics' own stream=True source handling opens the camera at
+        # whatever resolution the driver defaults to (often 640x480), which
+        # silently breaks zone/line coordinates: those are stored -- and
+        # rendered on the frontend map -- in FRAME_WIDTH x FRAME_HEIGHT
+        # pixel space. Opening the capture ourselves and requesting that
+        # resolution explicitly keeps detection coordinates consistent with
+        # where zones/lines actually are.
+        cap = cv2.VideoCapture(source)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, settings.frame_width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, settings.frame_height)
+        actual_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if (actual_w, actual_h) != (settings.frame_width, settings.frame_height):
+            logger.warning(
+                "camera does not support configured %dx%d; running at %dx%d instead -- "
+                "update FRAME_WIDTH/FRAME_HEIGHT in .env to match so zone/line "
+                "coordinates and the frontend map line up with reality",
+                settings.frame_width,
+                settings.frame_height,
+                actual_w,
+                actual_h,
+            )
+
         model = YOLO(settings.yolo_model)
         try:
-            results = model.track(
-                source=source,
-                classes=[0],  # COCO class 0 = person
-                persist=True,
-                stream=True,
-                tracker="bytetrack.yaml",
-                device=settings.yolo_device,
-                verbose=False,
-            )
-            for result in results:
-                if self._stop.is_set():
+            while not self._stop.is_set():
+                ok, frame = cap.read()
+                if not ok:
+                    logger.warning("camera read failed, stopping detector loop")
                     break
+
+                results = model.track(
+                    frame,
+                    classes=[0],  # COCO class 0 = person
+                    persist=True,
+                    tracker="bytetrack.yaml",
+                    device=settings.yolo_device,
+                    verbose=False,
+                )
+                result = results[0]
 
                 ts = datetime.now(timezone.utc)
                 active_ids: set[int] = set()
@@ -81,3 +108,5 @@ class VideoDetector:
                 self._emit(events)
         except Exception:
             logger.exception("video detector loop crashed")
+        finally:
+            cap.release()
