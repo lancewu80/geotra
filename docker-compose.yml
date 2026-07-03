@@ -1,0 +1,66 @@
+# Full containerized stack: PostGIS + backend (YOLO/FastAPI, GPU) + frontend
+# (nginx). See DEPLOYMENT.md for prerequisites and the webcam-passthrough
+# caveat on Windows before using this file as-is.
+services:
+  postgres:
+    image: postgis/postgis:16-3.4
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: peoplecount
+      POSTGRES_PASSWORD: peoplecount
+      POSTGRES_DB: peoplecount
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./backend/scripts/init_db.sql:/docker-entrypoint-initdb.d/init_db.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U peoplecount"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build:
+      context: ./backend
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      # overrides the .env value so the backend reaches Postgres by
+      # service name instead of localhost
+      DATABASE_URL: postgresql+asyncpg://peoplecount:peoplecount@postgres:5432/peoplecount
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    # Only works when the Docker engine itself has access to the device —
+    # true on native Linux hosts, and on Windows only after passing the
+    # camera through to WSL2 with usbipd-win. If you're using an RTSP/IP
+    # camera instead, delete this block and just point CAMERA_SOURCE at
+    # the stream URL in backend/.env.
+    devices:
+      - /dev/video0:/dev/video0
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        VITE_API_BASE: http://localhost:8000
+        VITE_WS_BASE: ws://localhost:8000
+    restart: unless-stopped
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
