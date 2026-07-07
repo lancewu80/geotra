@@ -1,7 +1,7 @@
 from datetime import datetime
 
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .. import models
@@ -13,60 +13,64 @@ router = APIRouter(prefix="/stats", tags=["stats"])
 
 @router.get("/zones", response_model=list[ZoneStats])
 async def zone_stats(session: AsyncSession = Depends(get_session)):
-    zones = (await session.execute(select(models.Zone))).scalars().all()
-    results = []
-    for zone in zones:
-        current_occupancy = (
-            await session.execute(
-                select(func.count())
-                .select_from(models.ZoneOccupancyEvent)
-                .where(
-                    models.ZoneOccupancyEvent.zone_id == zone.id,
-                    models.ZoneOccupancyEvent.exit_ts.is_(None),
-                )
-            )
-        ).scalar_one()
-        avg_dwell = (
-            await session.execute(
-                select(func.avg(models.ZoneOccupancyEvent.dwell_seconds)).where(
-                    models.ZoneOccupancyEvent.zone_id == zone.id,
-                    models.ZoneOccupancyEvent.exit_ts.is_not(None),
-                )
-            )
-        ).scalar_one()
-        results.append(
-            ZoneStats(
-                zone_id=zone.id,
-                zone_name=zone.name,
-                current_occupancy=current_occupancy,
-                avg_dwell_seconds=avg_dwell,
-            )
+    # single aggregate query instead of 1 + 2*N (N = zone count) round trips,
+    # so cost doesn't scale with how many clients poll this concurrently
+    stmt = (
+        select(
+            models.Zone.id,
+            models.Zone.name,
+            func.count(models.ZoneOccupancyEvent.id)
+            .filter(models.ZoneOccupancyEvent.exit_ts.is_(None))
+            .label("current_occupancy"),
+            func.avg(models.ZoneOccupancyEvent.dwell_seconds)
+            .filter(models.ZoneOccupancyEvent.exit_ts.is_not(None))
+            .label("avg_dwell_seconds"),
         )
-    return results
+        .select_from(models.Zone)
+        .outerjoin(models.ZoneOccupancyEvent, models.ZoneOccupancyEvent.zone_id == models.Zone.id)
+        .group_by(models.Zone.id, models.Zone.name)
+    )
+    rows = (await session.execute(stmt)).all()
+    return [
+        ZoneStats(
+            zone_id=r.id,
+            zone_name=r.name,
+            current_occupancy=r.current_occupancy,
+            avg_dwell_seconds=r.avg_dwell_seconds,
+        )
+        for r in rows
+    ]
 
 
 @router.get("/crossings", response_model=list[CrossingStats])
 async def crossing_stats(since: datetime | None = None, session: AsyncSession = Depends(get_session)):
-    lines = (await session.execute(select(models.Line))).scalars().all()
-    results = []
-    for line in lines:
-        in_stmt = select(func.count()).select_from(models.CrossingEvent).where(
-            models.CrossingEvent.line_id == line.id, models.CrossingEvent.direction == "in"
+    # the `since` filter has to live in the JOIN condition rather than a
+    # WHERE clause, otherwise the outer join degrades into an inner join
+    # and lines with zero crossings in the window would drop out entirely
+    join_condition = models.CrossingEvent.line_id == models.Line.id
+    if since:
+        join_condition = and_(join_condition, models.CrossingEvent.ts >= since)
+
+    stmt = (
+        select(
+            models.Line.id,
+            models.Line.name,
+            func.count(models.CrossingEvent.id)
+            .filter(models.CrossingEvent.direction == "in")
+            .label("in_count"),
+            func.count(models.CrossingEvent.id)
+            .filter(models.CrossingEvent.direction == "out")
+            .label("out_count"),
         )
-        out_stmt = select(func.count()).select_from(models.CrossingEvent).where(
-            models.CrossingEvent.line_id == line.id, models.CrossingEvent.direction == "out"
-        )
-        if since:
-            in_stmt = in_stmt.where(models.CrossingEvent.ts >= since)
-            out_stmt = out_stmt.where(models.CrossingEvent.ts >= since)
-        in_count = (await session.execute(in_stmt)).scalar_one()
-        out_count = (await session.execute(out_stmt)).scalar_one()
-        results.append(
-            CrossingStats(
-                line_id=line.id, line_name=line.name, in_count=in_count, out_count=out_count
-            )
-        )
-    return results
+        .select_from(models.Line)
+        .outerjoin(models.CrossingEvent, join_condition)
+        .group_by(models.Line.id, models.Line.name)
+    )
+    rows = (await session.execute(stmt)).all()
+    return [
+        CrossingStats(line_id=r.id, line_name=r.name, in_count=r.in_count, out_count=r.out_count)
+        for r in rows
+    ]
 
 
 @router.get("/heatmap", response_model=list[HeatmapCell])
